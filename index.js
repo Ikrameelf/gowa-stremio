@@ -16,8 +16,14 @@ const PORT = Number(process.env.PORT) || 7000;
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '';          // clé v3
 const TMDB_TOKEN = process.env.TMDB_TOKEN || '';              // ou jeton v4 (Bearer)
 const TMDB_BASE_URL = (process.env.TMDB_BASE_URL || 'https://api.themoviedb.org/3').replace(/\/$/, '');
-const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 25000;
+// Délai max AVANT de répondre à Stremio. Passé ce délai, on renvoie ce qui est
+// déjà trouvé ; les providers lents continuent en arrière-plan et leurs
+// résultats sont servis dès la requête suivante (rouvrir l'épisode).
+const RESPONSE_DEADLINE_MS = Number(process.env.RESPONSE_DEADLINE_MS) || 15000;
+// Délai max réel d'un provider (arrière-plan compris).
+const PROVIDER_TIMEOUT_MS = Number(process.env.PROVIDER_TIMEOUT_MS) || 60000;
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS) || 5 * 60 * 1000;
+const EMPTY_RETRY_MS = 60 * 1000; // un résultat vide est retenté après 1 min
 const ADDON_NAME = process.env.ADDON_NAME || 'Gowaru FR';
 
 // Réglages transmis aux providers (équivalent des réglages de l'app Nuvio).
@@ -184,50 +190,105 @@ function toStremioStream(providerId, s, index) {
 }
 
 // ─── Résolution d'une requête /stream ───────────────────────────────────────
-const streamCache = new Map(); // key -> { at, streams }
-const inflight = new Map();    // key -> Promise
+// Chaque requête (film ou épisode) devient une « tâche » qui lance tous les
+// providers en parallèle. On répond à Stremio au bout de RESPONSE_DEADLINE_MS
+// au plus, avec ce qui est déjà trouvé. Les providers lents continuent en
+// arrière-plan : leurs flux sont ajoutés à la tâche et servis à la requête suivante.
+const jobs = new Map(); // key -> job
 
-async function resolveStreams(type, rawId) {
-  const [imdbId, seasonStr, episodeStr] = rawId.split(':');
-  const season = type === 'series' ? Number(seasonStr) : null;
-  const episode = type === 'series' ? Number(episodeStr) : null;
-  if (type === 'series' && (!season || !episode)) return [];
+function startJob(type, rawId) {
+  const job = {
+    createdAt: Date.now(),
+    finishedAt: null,
+    error: null,
+    results: new Map(), // providerId -> flux Stremio[]
+    done: 0,
+    total: providers.length,
+    tmdbId: null,
+    allDone: null,
+  };
 
-  const tmdbId = await imdbToTmdb(imdbId, type === 'movie' ? 'movie' : 'series');
-  if (!tmdbId) return [];
+  job.allDone = (async () => {
+    const [imdbId, seasonStr, episodeStr] = rawId.split(':');
+    const season = type === 'series' ? Number(seasonStr) : null;
+    const episode = type === 'series' ? Number(episodeStr) : null;
+    if (type === 'series' && (!season || !episode)) return;
 
-  const results = await Promise.all(
-    providers.map(async (p) => {
-      const list = await withProviderTimeout(p, tmdbId, type, season, episode);
-      return list.map((s, i) => toStremioStream(p.id, s, i)).filter(Boolean);
+    job.tmdbId = await imdbToTmdb(imdbId, type === 'movie' ? 'movie' : 'series');
+    if (!job.tmdbId) return;
+
+    await Promise.all(
+      providers.map(async (p) => {
+        const list = await withProviderTimeout(p, job.tmdbId, type, season, episode);
+        job.results.set(p.id, list.map((s, i) => toStremioStream(p.id, s, i)).filter(Boolean));
+        job.done++;
+      })
+    );
+  })()
+    .catch((e) => {
+      job.error = e;
+      console.error(`[addon] ${type}/${rawId} : ${e.message}`);
     })
-  );
+    .finally(() => {
+      job.finishedAt = Date.now();
+    });
 
-  const seen = new Set();
-  const streams = results.flat().filter((s) => {
-    if (seen.has(s.url)) return false;
-    seen.add(s.url);
-    return true;
-  });
-  streams.sort((a, b) => b._score - a._score);
-  streams.forEach((s) => delete s._score);
-  return streams;
+  return job;
 }
 
-async function getStreamsCached(type, id) {
-  const key = `${type}:${id}`;
-  const hit = streamCache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.streams;
-  if (inflight.has(key)) return inflight.get(key);
+function collectStreams(job) {
+  const seen = new Set();
+  const all = [];
+  for (const list of job.results.values()) {
+    for (const s of list) {
+      if (seen.has(s.url)) continue;
+      seen.add(s.url);
+      all.push(s);
+    }
+  }
+  all.sort((a, b) => b._score - a._score);
+  return all.map(({ _score, ...stream }) => stream); // eslint-disable-line no-unused-vars
+}
 
-  const p = resolveStreams(type, id)
-    .then((streams) => {
-      if (streams.length) streamCache.set(key, { at: Date.now(), streams });
-      return streams;
-    })
-    .finally(() => inflight.delete(key));
-  inflight.set(key, p);
-  return p;
+function jobExpired(job) {
+  const now = Date.now();
+  if (!job.finishedAt) return now - job.createdAt > PROVIDER_TIMEOUT_MS + 30000;
+  const hasStreams = [...job.results.values()].some((l) => l.length);
+  const ttl = hasStreams && !job.error ? CACHE_TTL_MS : EMPTY_RETRY_MS;
+  return now - job.finishedAt > ttl;
+}
+
+function sweepJobs() {
+  for (const [key, job] of jobs) if (jobExpired(job)) jobs.delete(key);
+}
+
+async function getStreamsForRequest(type, id) {
+  const key = `${type}:${id}`;
+  let job = jobs.get(key);
+  if (job && jobExpired(job)) {
+    jobs.delete(key);
+    job = null;
+  }
+  if (!job) {
+    sweepJobs();
+    job = startJob(type, id);
+    jobs.set(key, job);
+  }
+
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(resolve, RESPONSE_DEADLINE_MS);
+  });
+  await Promise.race([job.allDone, deadline]);
+  clearTimeout(timer);
+
+  const streams = collectStreams(job);
+  const complete = Boolean(job.finishedAt);
+  console.log(
+    `[addon] ${key} → TMDB ${job.tmdbId || '?'} : ${streams.length} flux, ` +
+    `${job.done}/${job.total} providers terminés${complete ? '' : ' (les autres continuent en arrière-plan)'}`
+  );
+  return { streams, complete };
 }
 
 // ─── Serveur HTTP ───────────────────────────────────────────────────────────
@@ -269,8 +330,11 @@ const server = http.createServer(async (req, res) => {
   if (m) {
     const [, type, id] = m;
     try {
-      const streams = await getStreamsCached(type, id);
-      return send(res, 200, { streams, cacheMaxAge: 300, staleRevalidate: 3600 });
+      const { streams, complete } = await getStreamsForRequest(type, id);
+      // Résultat incomplet ou vide : Stremio ne doit pas le garder en cache,
+      // pour qu'une nouvelle ouverture récupère les flux arrivés entre-temps.
+      const cacheMaxAge = complete && streams.length ? 300 : 0;
+      return send(res, 200, { streams, cacheMaxAge });
     } catch (e) {
       console.error(`[addon] /stream ${type}/${id} : ${e.message}`);
       return send(res, 200, { streams: [] });
