@@ -197,7 +197,7 @@ function toStremioStream(providerId, s, index) {
   };
 
   const headers = cleanHeaders(s.headers);
-  if (Object.keys(headers).length) {
+if (process.env.NO_PROXY_HEADERS !== '1' && Object.keys(headers).length) {
     stream.behaviorHints.notWebReady = true;
     stream.behaviorHints.proxyHeaders = { request: headers };
   }
