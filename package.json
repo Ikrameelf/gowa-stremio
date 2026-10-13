@@ -1,0 +1,14 @@
+{
+  "name": "gowaru-stremio-addon",
+  "version": "1.0.0",
+  "description": "Addon Stremio qui embarque les providers français de gowaru-nuvio-providers",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "sync": "node sync-providers.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "GPL-3.0"
+}
