@@ -326,9 +326,12 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, html, 'text/html; charset=utf-8');
   }
 
-  const m = pathname.match(/^\/stream\/(movie|series)\/(.+?)(?:\.json)?$/);
+  // Stremio peut ajouter des paramètres après l'ID (ex. /stream/series/ID/videoHash=...json) :
+  // on ne garde que l'ID.
+  const m = pathname.match(/^\/stream\/(movie|series)\/([^/]+?)(?:\.json)?(?:\/[^/]*)?$/);
   if (m) {
     const [, type, id] = m;
+    console.log(`[addon] ← requête Stremio : ${req.url}  (UA: ${(req.headers['user-agent'] || '?').slice(0, 60)})`);
     try {
       const { streams, complete } = await getStreamsForRequest(type, id);
       // Résultat incomplet ou vide : Stremio ne doit pas le garder en cache,
