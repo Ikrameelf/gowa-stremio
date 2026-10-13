@@ -37,6 +37,34 @@ try {
   globalThis.SCRAPER_SETTINGS = {};
 }
 
+// Un plantage dans un provider ne doit jamais arrêter l'addon.
+process.on('unhandledRejection', (e) => console.error('[addon] unhandledRejection :', e && e.message ? e.message : e));
+process.on('uncaughtException', (e) => console.error('[addon] uncaughtException :', e && e.message ? e.message : e));
+
+// ─── Flux de test (TEST_STREAMS=1) ──────────────────────────────────────────
+// Ajoute 2 flux fixes en tête de CHAQUE liste, sans aucun provider. Sert à savoir
+// si le problème vient de Stremio / du compte ou des flux des providers :
+//   A = lien MP4 simple, B = le même lien avec headers (notWebReady + proxyHeaders).
+const TEST_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+const TEST_STREAMS = process.env.TEST_STREAMS === '1' ? [
+  {
+    name: `${ADDON_NAME}\nTEST A`,
+    title: 'Flux de test A (MP4 simple, sans headers)',
+    description: 'Flux de test A (MP4 simple, sans headers)',
+    url: TEST_URL,
+  },
+  {
+    name: `${ADDON_NAME}\nTEST B`,
+    title: 'Flux de test B (MP4 avec proxyHeaders)',
+    description: 'Flux de test B (MP4 avec proxyHeaders)',
+    url: TEST_URL,
+    behaviorHints: {
+      notWebReady: true,
+      proxyHeaders: { request: { Referer: 'https://example.com/', 'User-Agent': 'Mozilla/5.0' } },
+    },
+  },
+] : [];
+
 // ─── Chargement des providers ───────────────────────────────────────────────
 const PROVIDERS_DIR = path.join(__dirname, 'providers');
 
@@ -306,8 +334,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 204, '');
   if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed' });
 
-  const url = new URL(req.url, 'http://localhost');
-  const pathname = decodeURIComponent(url.pathname);
+  let pathname;
+  try {
+    pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+  } catch (e) {
+    return send(res, 400, { error: 'Bad request' });
+  }
 
   if (pathname === '/manifest.json') return send(res, 200, manifest);
 
@@ -337,10 +369,10 @@ const server = http.createServer(async (req, res) => {
       // Résultat incomplet ou vide : Stremio ne doit pas le garder en cache,
       // pour qu'une nouvelle ouverture récupère les flux arrivés entre-temps.
       const cacheMaxAge = complete && streams.length ? 300 : 0;
-      return send(res, 200, { streams, cacheMaxAge });
+      return send(res, 200, { streams: [...TEST_STREAMS, ...streams], cacheMaxAge });
     } catch (e) {
       console.error(`[addon] /stream ${type}/${id} : ${e.message}`);
-      return send(res, 200, { streams: [] });
+      return send(res, 200, { streams: [...TEST_STREAMS] });
     }
   }
 
